@@ -58,6 +58,7 @@ class UseFlowChainTest {
     private InMemoryMapper<THmfUseFlowStageLog> logs;
     private InMemoryMapper<THmfAcctCard> cards;
     private InMemoryMapper<THmfPayRow> payRows;
+    private FakePayBookMapper books;
 
     /** 定点时钟：起单/作废等未显式给时刻的动作统一落在 T0，保证痕迹时间序可验。 */
     private long clock = T0.getTime();
@@ -78,10 +79,12 @@ class UseFlowChainTest {
         inject("hmfUseFlowStageLogMapper", logs);
         inject("hmfAcctCardMapper", cards);
         inject("hmfPayRowMapper", payRows);
+        this.books = new FakePayBookMapper();
+        inject("hmfPayBookMapper", books);
         fund("JZ00", "FH-0001", new BigDecimal("500000.00"));
     }
 
-    /** 给某底册挂一个分户账号，并存入一笔已销账交存。 */
+    /** 给某底册挂一个分户账号，并存入一笔已销账交存（旧批法行：无册头、在现行册面层）。 */
     private void fund(String siteNo, String acctNo, BigDecimal qty) {
         THmfAcctCard c = new THmfAcctCard();
         c.setBillNo(acctNo);
@@ -93,6 +96,7 @@ class UseFlowChainTest {
         row.setItemCode(acctNo);
         row.setQty(qty);
         row.setStatus(1);
+        row.setLayer(0);
         row.setDelFlag(0);
         payRows.insert(row);
     }
@@ -545,5 +549,58 @@ class UseFlowChainTest {
         UseFlowAudit a = service.auditUseFlow(404L);
         assertFalse(a.isPass());
         assertNull(service.pushUseFlow(null));
+    }
+
+    // ---- 户面余额与册子核销同源：撤册行/往期行不算，旧批法无册头行照旧算 ----
+
+    @Test
+    void householdBalance_followsSameRuleAsBookReconcile() {
+        String site = "JZALIGN";
+        THmfAcctCard c = new THmfAcctCard();
+        c.setBillNo("FH-AL");
+        c.setSiteNo(site);
+        c.setDelFlag(0);
+        cards.insert(c);
+
+        // 已撤册册头下的已销现行行：随册作废，不进户面
+        com.fc.v2.model.auto.THmfPayBook withdrawn = new com.fc.v2.model.auto.THmfPayBook();
+        withdrawn.setBatchNo("BK-W");
+        withdrawn.setStatus(1);
+        withdrawn.setDelFlag(0);
+        books.insert(withdrawn);
+        payRows.insert(payRow("BK-W", withdrawn.getId(), "FH-AL", "100000.00", 1, 0));
+
+        // 在册册头下挪到往期层的行：现行册面不露，不进户面
+        com.fc.v2.model.auto.THmfPayBook active = new com.fc.v2.model.auto.THmfPayBook();
+        active.setBatchNo("BK-A");
+        active.setStatus(0);
+        active.setDelFlag(0);
+        books.insert(active);
+        payRows.insert(payRow("BK-A", active.getId(), "FH-AL", "100000.00", 1, 1));
+        // 同册挂起行（现行层但未销）：也不进户面
+        payRows.insert(payRow("BK-A", active.getId(), "FH-AL", "100000.00", 2, 0));
+
+        // 三笔都不进户面：128000 的列支过不去余额门
+        Long id = toBuild(openAt(site, "SY-ALIGN-001").getId());
+        assertEquals(UseFlowVerdict.CODE_STAY, toSettle(id).getCode(),
+                "撤册行、往期行、挂起行都不许 inflate 户面");
+
+        // 旧批法行：无册头、已销、现行层——照旧进户面，补足后列支过门
+        payRows.insert(payRow("B-OLD", null, "FH-AL", "128000.00", 1, 0));
+        UseFlowVerdict v = toSettle(id);
+        assertEquals(UseFlowVerdict.CODE_MOVED, v.getCode(),
+                "旧批法无册头的已销现行行照旧计户面，与册子规矩合在一处");
+    }
+
+    private THmfPayRow payRow(String batchNo, Long bookId, String acct, String qty, int status, int layer) {
+        THmfPayRow r = new THmfPayRow();
+        r.setBatchNo(batchNo);
+        r.setBookId(bookId);
+        r.setItemCode(acct);
+        r.setQty(new BigDecimal(qty));
+        r.setStatus(status);
+        r.setLayer(layer);
+        r.setDelFlag(0);
+        return r;
     }
 }

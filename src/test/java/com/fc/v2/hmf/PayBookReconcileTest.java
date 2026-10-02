@@ -328,6 +328,20 @@ class PayBookReconcileTest {
         assertEquals("核讫", rc.getResultText());
     }
 
+    // ---- 本行到账金额：归一到库口 decimal(12,2)，算钱的底子两处同源 ----
+
+    @Test
+    void arriveQty_normalizedToDbScale_beforeClearing() {
+        // 8000.005 进门四舍五入到 8000.01 再销账，户面累加也只认归一后的数
+        PayBookReceipt rc = service.reconcilePayBook("CE-QTY",
+                java.util.Collections.singletonList(row("FH-JIA", "8000.005", "2026-01-05")));
+        THmfPayRow stored = service.listCurrentRows("CE-QTY").get(0);
+        assertEquals(0, new BigDecimal("8000.01").compareTo(stored.getQty()));
+        assertEquals(2, stored.getQty().scale());
+        assertEquals(CLEARED, stored.getStatus().intValue());
+        assertEquals(0, new BigDecimal("8000.01").compareTo(rc.getRows().get(0).getQty()));
+    }
+
     // ---- 挂起连跨两个对账季挪往期；季末含当日 ----
 
     @Test

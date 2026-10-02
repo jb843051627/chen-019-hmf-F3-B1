@@ -45,7 +45,7 @@ import com.fc.v2.service.ITHmfPayRowService;
 @Service
 public class THmfPayRowServiceImpl implements ITHmfPayRowService {
 
-    // ---------------------------------------------------------------- 旧批法（入参给回原样，不动）
+    // ---------------------------------------------------------------- 旧批法（整批提交，进门口径与册子核销对齐）
 
     private static final int MAX_ROWS = 500;
     private static final int STATUS_OK = 1;
@@ -100,38 +100,90 @@ public class THmfPayRowServiceImpl implements ITHmfPayRowService {
     @Override
     @Transactional(rollbackFor = Exception.class)
     public int submitBatch(String batchNo, List<THmfPayRow> rows) {
-        String no = rows.get(0).getBatchNo();
-        java.util.List<THmfPayRow> errors = new java.util.ArrayList<THmfPayRow>();
-        int seq = 0;
-        for (THmfPayRow r : rows) {
-            if (r.getItemCode() == null || r.getItemCode().trim().isEmpty()
-                    || r.getQty() == null
-                    || r.getQty().compareTo(java.math.BigDecimal.ZERO) <= 0) {
-                seq++;
-                r.setRowNo(Integer.valueOf(seq));
-                r.setBatchNo(no);
-                r.setStatus(STATUS_FAIL);
-                this.hmfPayRowMapper.insert(r);
-                errors.add(r);
-            }
-        }
-        if (!errors.isEmpty()) {
+        // 空批先判空：不许伸手摸 rows.get(0)，摸着就是越界。
+        if (rows == null || rows.isEmpty() || isBlank(batchNo)) {
             return 0;
         }
-        int ok = 0;
-        for (THmfPayRow r : rows) {
-            r.setBatchNo(no);
-            r.setStatus(STATUS_OK);
-            this.hmfPayRowMapper.insert(r);
-            ok++;
+        // 两处规矩同源：册次号只认进门入参，行里夹带的号一概不看。
+        String no = batchNo.trim();
+
+        // 同一批重发只认头一遍：该批已有落库的行（好行或失败明细），照头一遍的成功数回话，
+        // 不重插、不另起一拨。并发两趟叠着进门，落后那趟在这道门口原样退出，数据不翻倍。
+        if (this.hmfPayRowMapper.selectCount(new QueryWrapper<THmfPayRow>()
+                .eq("batch_no", no).eq("del_flag", 0)) > 0) {
+            return this.hmfPayRowMapper.selectCount(new QueryWrapper<THmfPayRow>()
+                    .eq("batch_no", no).eq("status", STATUS_OK).eq("del_flag", 0));
         }
-        return ok;
+
+        // 行数超中心定的上限：整批不入库，-1 回话（与册法“原册退回、一行不留”同一处裁）。
+        if (rows.size() > MAX_ROWS) {
+            return -1;
+        }
+
+        // 同一趟判完才落库：逐行校验、同批去重在这一趟里一起点清，不边判边插——
+        // 回滚时库里不留半截，并发叠上来时，两趟数出的结果对得拢。
+        List<THmfPayRow> valid = new ArrayList<>();
+        List<THmfPayRow> errors = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        int idx = 0;
+        for (THmfPayRow in : rows) {
+            idx++; // 原册行号：在原册排第几就是几，坏行也好行也好，都照这个号说话
+            BigDecimal qty = PayRowAmounts.normalize(in == null ? null : in.getQty());
+            if (in == null || isBlank(in.getItemCode()) || qty == null
+                    || qty.compareTo(BigDecimal.ZERO) <= 0) {
+                THmfPayRow bad = copyForStore(in, no);
+                bad.setRowNo(idx); // 失败明细保留原行号，不许只数坏行重新编号
+                bad.setStatus(STATUS_FAIL);
+                errors.add(bad);
+                continue;
+            }
+            String acct = in.getItemCode().trim();
+            // 同批里同一个明细码进了两条：第二条与头一条对不拢，就地记入失败，不连累别行。
+            if (!seen.add(acct)) {
+                THmfPayRow dup = copyForStore(in, no);
+                dup.setRowNo(idx);
+                dup.setStatus(STATUS_FAIL);
+                dup.setHoldReason("同批明细码" + acct + "重复进门，本行照非法行记回");
+                errors.add(dup);
+                continue;
+            }
+            valid.add(copyForStore(in, no));
+        }
+
+        // 一行非法只退它自己一行：合规行照单落库，不再整批退回、连累合规行。
+        for (THmfPayRow bad : errors) {
+            bad.setCreateTime(new Date());
+            this.hmfPayRowMapper.insert(bad);
+        }
+        for (THmfPayRow r : valid) {
+            r.setStatus(STATUS_OK);
+            r.setLayer(LAYER_CURRENT);
+            r.setDelFlag(0);
+            r.setCreateTime(new Date());
+            this.hmfPayRowMapper.insert(r);
+        }
+        return valid.size();
+    }
+
+    /** 旧批法：照入参誊一行落库用的行；册次号只认进门的号，到账金额先归一到库口精度。 */
+    private THmfPayRow copyForStore(THmfPayRow in, String batchNo) {
+        THmfPayRow r = new THmfPayRow();
+        r.setBatchNo(batchNo);
+        if (in != null) {
+            r.setItemCode(in.getItemCode() == null ? null : in.getItemCode().trim());
+            r.setQty(PayRowAmounts.normalize(in.getQty()));
+            r.setPayDate(in.getPayDate());
+            r.setRemark(in.getRemark());
+        }
+        r.setDelFlag(0);
+        return r;
     }
 
     @Override
     public List<THmfPayRow> listErrors(String batchNo) {
         return this.hmfPayRowMapper.selectList(new QueryWrapper<THmfPayRow>()
-                .eq("batch_no", batchNo).eq("status", STATUS_FAIL));
+                .eq("batch_no", batchNo).eq("status", STATUS_FAIL)
+                .orderByAsc("row_no"));
     }
 
     // ---------------------------------------------------------------- 册子核销一趟
@@ -165,14 +217,16 @@ public class THmfPayRowServiceImpl implements ITHmfPayRowService {
         int seq = 0;
         for (THmfPayRow in : rows) {
             // 户号空、金额不正、交存日期没到的行连判定都无从判起，整册不收（并非超限，不写一行）。
-            if (in == null || isBlank(in.getItemCode()) || in.getQty() == null
-                    || in.getQty().compareTo(BigDecimal.ZERO) <= 0 || in.getPayDate() == null) {
+            // 到账金额是算钱的底子，进门先在同一处归一到库口精度，再判再记，与旧批法/下游同源。
+            BigDecimal qty = PayRowAmounts.normalize(in == null ? null : in.getQty());
+            if (in == null || isBlank(in.getItemCode()) || qty == null
+                    || qty.compareTo(BigDecimal.ZERO) <= 0 || in.getPayDate() == null) {
                 return null;
             }
             THmfPayRow r = new THmfPayRow();
             r.setBatchNo(no);
             r.setItemCode(in.getItemCode().trim());
-            r.setQty(in.getQty());
+            r.setQty(qty);
             r.setPayDate(in.getPayDate());
             r.setRemark(in.getRemark());
             judged.add(r);
@@ -507,12 +561,7 @@ public class THmfPayRowServiceImpl implements ITHmfPayRowService {
     }
 
     private Set<Long> activeBookIds() {
-        Set<Long> ids = new HashSet<>();
-        for (THmfPayBook b : this.hmfPayBookMapper.selectList(new QueryWrapper<THmfPayBook>()
-                .eq("status", BOOK_ACTIVE).eq("del_flag", 0))) {
-            ids.add(b.getId());
-        }
-        return ids;
+        return HouseholdPaid.activeBookIds(this.hmfPayBookMapper);
     }
 
     /** 某在册册的各行（layer 给 null 则两层都取），按册内行次排，挂起行带着原来排第几。 */
@@ -526,22 +575,12 @@ public class THmfPayRowServiceImpl implements ITHmfPayRowService {
     }
 
     /**
-     * 点各在册册里已销账行按户号的合计：户面累加的底数。
-     * 已撤册（其行随册作废）、挂起行、往期层的挂起行都不进户面。
+     * 点各在册册里已销账行按户号的合计：户面累加的底数。规矩合在 {@link HouseholdPaid} 一处，
+     * 与下游使用申请点户面余额同源——已撤册、挂起行、往期层的挂起行都不进户面；
+     * 旧批法无册头的行照旧计。
      */
     private Map<String, BigDecimal> householdPaidTotals() {
-        Set<Long> activeBookIds = activeBookIds();
-        Map<String, BigDecimal> totals = new HashMap<>();
-        for (THmfPayRow r : this.hmfPayRowMapper.selectList(new QueryWrapper<THmfPayRow>()
-                .eq("status", ROW_CLEARED).eq("layer", LAYER_CURRENT).eq("del_flag", 0))) {
-            if (r.getBookId() == null || !activeBookIds.contains(r.getBookId())
-                    || isBlank(r.getItemCode()) || r.getQty() == null) {
-                continue;
-            }
-            String acct = r.getItemCode().trim();
-            totals.merge(acct, r.getQty(), BigDecimal::add);
-        }
-        return totals;
+        return HouseholdPaid.totalsByAccount(this.hmfPayRowMapper, this.hmfPayBookMapper);
     }
 
     private void fillCounts(PayBookReceipt receipt, THmfPayBook book) {

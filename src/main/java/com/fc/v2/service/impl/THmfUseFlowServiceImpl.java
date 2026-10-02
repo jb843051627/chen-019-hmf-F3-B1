@@ -101,9 +101,6 @@ public class THmfUseFlowServiceImpl implements ITHmfUseFlowService {
     @javax.annotation.Resource
     private com.fc.v2.mapper.auto.THmfPayBookMapper hmfPayBookMapper;
 
-    /** 交存核销行：已销账 */
-    private static final int PAY_ROW_CLEARED = 1;
-
     // ---------------------------------------------------------------- 旧读法不动
 
     @Override
@@ -571,24 +568,19 @@ public class THmfUseFlowServiceImpl implements ITHmfUseFlowService {
         }
         BigDecimal deposited = BigDecimal.ZERO;
         if (!accounts.isEmpty()) {
-            // 已撤册的行随册作废，不计户面（新旧册以 book_id 分清）；旧批法无册头的行照旧计。
-            java.util.Set<Long> activeBookIds = new java.util.HashSet<>();
-            List<com.fc.v2.model.auto.THmfPayBook> liveBooks =
-                    this.hmfPayBookMapper == null ? java.util.Collections.emptyList()
-                            : this.hmfPayBookMapper.selectList(new QueryWrapper<com.fc.v2.model.auto.THmfPayBook>()
-                                    .eq("status", 0).eq("del_flag", 0));
-            for (com.fc.v2.model.auto.THmfPayBook b : liveBooks) {
-                activeBookIds.add(b.getId());
-            }
-            List<THmfPayRow> rows = this.hmfPayRowMapper.selectList(new QueryWrapper<THmfPayRow>()
-                    .eq("status", PAY_ROW_CLEARED).eq("del_flag", 0));
-            for (THmfPayRow row : rows) {
-                if (row.getBookId() != null && !activeBookIds.contains(row.getBookId())) {
+            // 户面认哪些行与册子核销的户面累加同源（规矩合在 HouseholdPaid 一处）：
+            // 只认已销账、现行册面层、未删的行；已撤册的行随册作废，不计户面；
+            // 旧批法无册头（book_id 为空）的行照旧计。
+            java.util.Set<Long> activeBookIds =
+                    HouseholdPaid.activeBookIds(this.hmfPayBookMapper);
+            for (THmfPayRow row : HouseholdPaid.clearedCurrentRows(this.hmfPayRowMapper)) {
+                if (!HouseholdPaid.countsTowardHousehold(row, activeBookIds)) {
                     continue;
                 }
                 if (row.getItemCode() != null && accounts.contains(row.getItemCode().trim())
                         && row.getQty() != null) {
-                    deposited = deposited.add(row.getQty());
+                    // 到账金额是算钱的底子：只认归一到库口精度后的数，与进门处同源。
+                    deposited = deposited.add(PayRowAmounts.normalize(row.getQty()));
                 }
             }
         }
