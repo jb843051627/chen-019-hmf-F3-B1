@@ -16,7 +16,6 @@ import com.fc.v2.mapper.auto.THmfPayRowMapper;
 import com.fc.v2.mapper.auto.THmfUseFlowMapper;
 import com.fc.v2.mapper.auto.THmfUseFlowStageLogMapper;
 import com.fc.v2.model.auto.THmfAcctCard;
-import com.fc.v2.model.auto.THmfPayRow;
 import com.fc.v2.model.auto.THmfUseFlow;
 import com.fc.v2.model.auto.THmfUseFlowStageLog;
 import com.fc.v2.model.custom.UseFlowAdvance;
@@ -100,9 +99,6 @@ public class THmfUseFlowServiceImpl implements ITHmfUseFlowService {
 
     @javax.annotation.Resource
     private com.fc.v2.mapper.auto.THmfPayBookMapper hmfPayBookMapper;
-
-    /** 交存核销行：已销账 */
-    private static final int PAY_ROW_CLEARED = 1;
 
     // ---------------------------------------------------------------- 旧读法不动
 
@@ -556,6 +552,7 @@ public class THmfUseFlowServiceImpl implements ITHmfUseFlowService {
     /**
      * 点某底册此刻户面可用余额：经分户账立户单挂到该底册的已销账交存行合计，
      * 减去同底册各单已列支合计。列支前点，钱不够结算门不开。
+     * 已收合计与交存核销侧同一处口径（{@link HmfHouseholdRules}），两处不对各点各的。
      */
     private BigDecimal accountBalanceOf(String siteNo) {
         if (isBlank(siteNo)) {
@@ -571,24 +568,14 @@ public class THmfUseFlowServiceImpl implements ITHmfUseFlowService {
         }
         BigDecimal deposited = BigDecimal.ZERO;
         if (!accounts.isEmpty()) {
-            // 已撤册的行随册作废，不计户面（新旧册以 book_id 分清）；旧批法无册头的行照旧计。
-            java.util.Set<Long> activeBookIds = new java.util.HashSet<>();
-            List<com.fc.v2.model.auto.THmfPayBook> liveBooks =
-                    this.hmfPayBookMapper == null ? java.util.Collections.emptyList()
-                            : this.hmfPayBookMapper.selectList(new QueryWrapper<com.fc.v2.model.auto.THmfPayBook>()
-                                    .eq("status", 0).eq("del_flag", 0));
-            for (com.fc.v2.model.auto.THmfPayBook b : liveBooks) {
-                activeBookIds.add(b.getId());
-            }
-            List<THmfPayRow> rows = this.hmfPayRowMapper.selectList(new QueryWrapper<THmfPayRow>()
-                    .eq("status", PAY_ROW_CLEARED).eq("del_flag", 0));
-            for (THmfPayRow row : rows) {
-                if (row.getBookId() != null && !activeBookIds.contains(row.getBookId())) {
-                    continue;
-                }
-                if (row.getItemCode() != null && accounts.contains(row.getItemCode().trim())
-                        && row.getQty() != null) {
-                    deposited = deposited.add(row.getQty());
+            // 户面已收与核销侧同一处口径（HmfHouseholdRules）：已撤册的行随册作废不算，
+            // 旧批法无册头的已销行照计——两处点同一本账，账才对得拢。
+            Map<String, BigDecimal> totals = HmfHouseholdRules.clearedTotalsByAcct(
+                    this.hmfPayRowMapper, this.hmfPayBookMapper);
+            for (String acct : accounts) {
+                BigDecimal t = totals.get(acct);
+                if (t != null) {
+                    deposited = deposited.add(t);
                 }
             }
         }

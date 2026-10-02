@@ -5,14 +5,16 @@ import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.fc.v2.mapper.auto.THmfAcctCardMapper;
@@ -39,22 +41,25 @@ import com.fc.v2.service.ITHmfPayRowService;
  * 挂起连跨两个对账季无去向，挪往期层只供翻，现行册面不再露；交存日落在哪季算哪季（季末含当日）。
  * 册面总行数、这趟已销行数、挂起行数出自同一回统计，册首与各行一次落库；接不平当场列差行。
  *
+ * 旧批法 {@link #submitBatch} 与这趟同一杆秤：行合法性同 {@link #rowIllegalReason} 一处判定，
+ * 行数上限同 {@link #MAX_ROWS_PER_BOOK} 一处定，户面已收同 {@link HmfHouseholdRules} 一处点；
+ * 同号重发一行不加，并发进门靠门锁串行、锁包住事务提交，两处结果才对得拢。
+ *
  * @author fuce
  * @date 2026-09-14
  */
 @Service
 public class THmfPayRowServiceImpl implements ITHmfPayRowService {
 
-    // ---------------------------------------------------------------- 旧批法（入参给回原样，不动）
+    // ---------------------------------------------------------------- 口径常量（老批新批同一处）
 
-    private static final int MAX_ROWS = 500;
-    private static final int STATUS_OK = 1;
-    private static final int STATUS_FAIL = 2;
-
-    // ---------------------------------------------------------------- 册子核销口径常量
-
-    /** 中心定下的一册行数上限（进册先按整册看，超了原册退回、一行不留） */
+    /** 中心定下的一册行数上限（老批新批同这一处：进册先按整册看，超了原册退回、一行不留） */
     private static final int MAX_ROWS_PER_BOOK = 500;
+
+    /** 旧批法行去向：已销（值与新批法已销账同为 1，户面只认这个数） */
+    private static final int STATUS_OK = 1;
+    /** 旧批法行去向：失败（只记失败明细，不进户面） */
+    private static final int STATUS_FAIL = 2;
 
     /** 行去向：未销（判定前暂态，落库的行不可能停在这） */
     private static final int ROW_PENDING = 0;
@@ -90,7 +95,42 @@ public class THmfPayRowServiceImpl implements ITHmfPayRowService {
     @javax.annotation.Resource
     private THmfAcctCardMapper hmfAcctCardMapper;
 
-    // ---------------------------------------------------------------- 旧批法（原样保留）
+    @javax.annotation.Resource
+    private ObjectProvider<PlatformTransactionManager> txManagerProvider;
+
+    // ---------------------------------------------------------------- 同号进门门锁
+
+    /**
+     * 同号册/批进门串行：查在册、判定、落库、提交全在一道门锁里办完才放锁。
+     * 并发两趟同号进门，后一趟等前一趟落定（提交或回滚）再查，两处结果才对得拢；
+     * 多实例部署时此锁只管本机，库上仍须以唯一约束兜底。
+     */
+    private static final int DOOR_LOCK_COUNT = 64;
+    private final Object[] doorLocks = new Object[DOOR_LOCK_COUNT];
+    {
+        for (int i = 0; i < DOOR_LOCK_COUNT; i++) {
+            doorLocks[i] = new Object();
+        }
+    }
+
+    private Object doorLock(String no) {
+        return this.doorLocks[(no.hashCode() & 0x7fffffff) % DOOR_LOCK_COUNT];
+    }
+
+    /**
+     * 门锁里开一趟事务：查重、判定、落库、提交全在临界区内办完。
+     * 认不到事务管理器的环境（定点核验/测试）直跑，逻辑同一趟。
+     */
+    private <T> T inTx(java.util.function.Supplier<T> body) {
+        PlatformTransactionManager tm = this.txManagerProvider == null
+                ? null : this.txManagerProvider.getIfUnique();
+        if (tm == null) {
+            return body.get();
+        }
+        return new TransactionTemplate(tm).execute(status -> body.get());
+    }
+
+    // ---------------------------------------------------------------- 旧批法（与新批法同一杆秤）
 
     @Override
     public THmfPayRow selectTHmfPayRowById(Long id) {
@@ -98,52 +138,96 @@ public class THmfPayRowServiceImpl implements ITHmfPayRowService {
     }
 
     @Override
-    @Transactional(rollbackFor = Exception.class)
     public int submitBatch(String batchNo, List<THmfPayRow> rows) {
-        String no = rows.get(0).getBatchNo();
-        java.util.List<THmfPayRow> errors = new java.util.ArrayList<THmfPayRow>();
-        int seq = 0;
-        for (THmfPayRow r : rows) {
-            if (r.getItemCode() == null || r.getItemCode().trim().isEmpty()
-                    || r.getQty() == null
-                    || r.getQty().compareTo(java.math.BigDecimal.ZERO) <= 0) {
-                seq++;
-                r.setRowNo(Integer.valueOf(seq));
-                r.setBatchNo(no);
-                r.setStatus(STATUS_FAIL);
-                this.hmfPayRowMapper.insert(r);
-                errors.add(r);
-            }
-        }
-        if (!errors.isEmpty()) {
+        // 空批判空在先：没行可交，回 0，不越界
+        if (isBlank(batchNo) || rows == null || rows.isEmpty()) {
             return 0;
         }
+        // 超中心定的上限：整批退回、一行不留，回 -1（上限与新批法同一处）
+        if (rows.size() > MAX_ROWS_PER_BOOK) {
+            return -1;
+        }
+        String no = batchNo.trim();
+        // 同号进门串行：查重、判定、落库、提交在一道门锁里办完
+        synchronized (doorLock(no)) {
+            return inTx(() -> doSubmitBatch(no, rows));
+        }
+    }
+
+    /**
+     * 整批落库一趟（只在门锁里、事务里跑）：同号第二遍一行不加，回 0；
+     * 逐行照同一杆秤判定，合法行记已销、非法行记失败明细，同一回写出——
+     * 不两段、不先插后回滚，失败明细与已销行要么都在、要么都不在。
+     */
+    private int doSubmitBatch(String no, List<THmfPayRow> rows) {
+        // 同一批重发：库里已有此批的行，一行不加（不得重复入库，加了户面就翻倍）
+        Integer existing = this.hmfPayRowMapper.selectCount(new QueryWrapper<THmfPayRow>()
+                .eq("batch_no", no).eq("del_flag", 0));
+        if (existing != null && existing.intValue() > 0) {
+            return 0;
+        }
+        // 逐行判定全在这一趟办完才落库；每行都占原行号——
+        // 失败明细里的行号就是原册第几行，不是失败行自排的序号
         int ok = 0;
-        for (THmfPayRow r : rows) {
+        int pos = 0;
+        List<THmfPayRow> judged = new ArrayList<>();
+        for (THmfPayRow in : rows) {
+            pos++;
+            THmfPayRow r = new THmfPayRow();
             r.setBatchNo(no);
-            r.setStatus(STATUS_OK);
+            r.setRowNo(Integer.valueOf(pos));
+            if (in != null) {
+                r.setItemCode(isBlank(in.getItemCode()) ? null : in.getItemCode().trim());
+                r.setQty(in.getQty());
+                r.setPayDate(in.getPayDate());
+                r.setRemark(in.getRemark());
+            }
+            String illegal = rowIllegalReason(in);
+            if (illegal == null) {
+                r.setStatus(STATUS_OK);
+                ok++;
+            } else {
+                // 非法行不连累同批合规行：就地记失败明细、写明缘由，合规行照入
+                r.setStatus(STATUS_FAIL);
+                r.setHoldReason(illegal);
+            }
+            r.setLayer(LAYER_CURRENT);
+            r.setDelFlag(0);
+            if (r.getPayDate() != null) {
+                r.setFromSeason(seasonOf(r.getPayDate()));
+            }
+            r.setCreateTime(new Date());
+            judged.add(r);
+        }
+        for (THmfPayRow r : judged) {
             this.hmfPayRowMapper.insert(r);
-            ok++;
         }
         return ok;
     }
 
     @Override
     public List<THmfPayRow> listErrors(String batchNo) {
+        // 失败明细按原行号升序回话，照号找行，不用猜
         return this.hmfPayRowMapper.selectList(new QueryWrapper<THmfPayRow>()
-                .eq("batch_no", batchNo).eq("status", STATUS_FAIL));
+                .eq("batch_no", batchNo).eq("status", STATUS_FAIL).orderByAsc("row_no"));
     }
 
     // ---------------------------------------------------------------- 册子核销一趟
 
     @Override
-    @Transactional(rollbackFor = Exception.class)
     public PayBookReceipt reconcilePayBook(String batchNo, List<THmfPayRow> rows) {
         if (isBlank(batchNo) || rows == null) {
             return null;
         }
         String no = batchNo.trim();
+        // 同号进门串行：查在册、判定、落库、提交在一道门锁里办完，
+        // 并发两趟同号进门不会各立一本册头
+        synchronized (doorLock(no)) {
+            return inTx(() -> doReconcilePayBook(no, rows));
+        }
+    }
 
+    private PayBookReceipt doReconcilePayBook(String no, List<THmfPayRow> rows) {
         // 册次号进门定死：在册的同号册只做比对，去向不改、行不加不改。
         THmfPayBook existing = activeBook(no);
         if (existing != null) {
@@ -165,8 +249,8 @@ public class THmfPayRowServiceImpl implements ITHmfPayRowService {
         int seq = 0;
         for (THmfPayRow in : rows) {
             // 户号空、金额不正、交存日期没到的行连判定都无从判起，整册不收（并非超限，不写一行）。
-            if (in == null || isBlank(in.getItemCode()) || in.getQty() == null
-                    || in.getQty().compareTo(BigDecimal.ZERO) <= 0 || in.getPayDate() == null) {
+            // 什么叫非法行与旧批法同一杆秤（rowIllegalReason），处置各别：这里整册不收。
+            if (rowIllegalReason(in) != null) {
                 return null;
             }
             THmfPayRow r = new THmfPayRow();
@@ -507,12 +591,7 @@ public class THmfPayRowServiceImpl implements ITHmfPayRowService {
     }
 
     private Set<Long> activeBookIds() {
-        Set<Long> ids = new HashSet<>();
-        for (THmfPayBook b : this.hmfPayBookMapper.selectList(new QueryWrapper<THmfPayBook>()
-                .eq("status", BOOK_ACTIVE).eq("del_flag", 0))) {
-            ids.add(b.getId());
-        }
-        return ids;
+        return HmfHouseholdRules.activeBookIds(this.hmfPayBookMapper);
     }
 
     /** 某在册册的各行（layer 给 null 则两层都取），按册内行次排，挂起行带着原来排第几。 */
@@ -526,22 +605,12 @@ public class THmfPayRowServiceImpl implements ITHmfPayRowService {
     }
 
     /**
-     * 点各在册册里已销账行按户号的合计：户面累加的底数。
-     * 已撤册（其行随册作废）、挂起行、往期层的挂起行都不进户面。
+     * 点各户号户面已收合计：户面累加的底数。
+     * 口径与列支侧同一处（{@link HmfHouseholdRules}）：已撤册的行随册作废、挂起行、
+     * 往期层都不进户面；旧批法无册头的已销行照计——两处点同一本账，账才对得拢。
      */
     private Map<String, BigDecimal> householdPaidTotals() {
-        Set<Long> activeBookIds = activeBookIds();
-        Map<String, BigDecimal> totals = new HashMap<>();
-        for (THmfPayRow r : this.hmfPayRowMapper.selectList(new QueryWrapper<THmfPayRow>()
-                .eq("status", ROW_CLEARED).eq("layer", LAYER_CURRENT).eq("del_flag", 0))) {
-            if (r.getBookId() == null || !activeBookIds.contains(r.getBookId())
-                    || isBlank(r.getItemCode()) || r.getQty() == null) {
-                continue;
-            }
-            String acct = r.getItemCode().trim();
-            totals.merge(acct, r.getQty(), BigDecimal::add);
-        }
-        return totals;
+        return HmfHouseholdRules.clearedTotalsByAcct(this.hmfPayRowMapper, this.hmfPayBookMapper);
     }
 
     private void fillCounts(PayBookReceipt receipt, THmfPayBook book) {
@@ -626,7 +695,28 @@ public class THmfPayRowServiceImpl implements ITHmfPayRowService {
         return year * 4 + (q - 1);
     }
 
-    private boolean isBlank(String s) {
+    /**
+     * 行合法性唯一出处（老批新批同一杆秤）：户号空、本行到帐金额不正、交存日期缺，皆为非法行。
+     * 旧批法拿它记失败明细、合规行照走；新批法拿它整册不收——处置各别，判定同源。
+     * 返回 null 为合法，否则为非法缘由（就地写明，不让人白找）。
+     */
+    private static String rowIllegalReason(THmfPayRow in) {
+        if (in == null) {
+            return "空行，无从判定";
+        }
+        if (isBlank(in.getItemCode())) {
+            return "户号缺失，销账只认户号";
+        }
+        if (in.getQty() == null || in.getQty().compareTo(BigDecimal.ZERO) <= 0) {
+            return "本行到帐金额缺失或不正";
+        }
+        if (in.getPayDate() == null) {
+            return "交存日期缺失，落在哪季无从钉起";
+        }
+        return null;
+    }
+
+    private static boolean isBlank(String s) {
         return s == null || s.trim().isEmpty();
     }
 }

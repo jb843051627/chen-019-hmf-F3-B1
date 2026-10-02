@@ -21,7 +21,7 @@ public interface ITHmfPayRowService {
 
     /**
      * 整批提交：逐行校验，合法的入库、非法的记入失败明细（保留原始行号），返回**成功行数**。
-     * 同一批次重复提交不得重复入库；行数超过单批上限返回 -1 且整批不入库；空批次返回 0。
+     * 同一批次重复提交不得重复入库（第二遍一行不加，回 0）；行数超过单批上限返回 -1 且整批不入库；空批次返回 0。
      */
     int submitBatch(String batchNo, List<THmfPayRow> rows);
 
